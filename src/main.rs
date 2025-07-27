@@ -7,7 +7,7 @@ use libp2p::{
     identity,
     mdns,
     swarm::{NetworkBehaviour, SwarmEvent},
-    PeerId,
+    Multiaddr, PeerId,
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -15,10 +15,10 @@ use std::error::Error;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use tokio::io::AsyncBufReadExt;
 use notify::{RecursiveMode, Watcher};
+use tokio::time;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Commit {
     id: String,
     message: String,
@@ -26,9 +26,17 @@ struct Commit {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+struct FullCommit {
+    commit: Commit,
+    files: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 enum SyncMessage {
     AskForCommits,
     MyCommits { commits: Vec<String> },
+    AskForCommit { commit_id: String },
+    FullCommit(FullCommit),
 }
 
 #[derive(Parser)]
@@ -91,6 +99,7 @@ enum Commands {
         #[arg(required = true)]
         files: Vec<String>,
     },
+    Pull,
 }
 
 #[tokio::main]
@@ -132,83 +141,172 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             if let Some(addr_str) = addr {
                 let remote: libp2p::Multiaddr = addr_str.parse()?;
-                swarm.dial(remote)?;
-                println!("Dialed peer at {addr_str}");
+                if let Err(e) = swarm.dial(remote.clone()) {
+                    println!("Failed to dial {addr_str}: {e}");
+                } else {
+                    println!("Dialed peer at {addr_str}");
+                    if let Err(e) = add_known_peer(&remote) {
+                        println!("Could not save peer address: {e}");
+                    }
+                }
             }
 
-            let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-
             swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-            println!("Type 'sync' to exchange commit data with peers.");
+            println!("Waiting for peers to connect for automatic synchronization...");
+
+            // Dial known peers from previous sessions
+            match get_known_peers() {
+                Ok(known_peers) => {
+                    for peer in known_peers {
+                        if let Err(e) = swarm.dial(peer.clone()) {
+                           println!("Failed to dial known peer {peer}: {e}");
+                        }
+                    }
+                }
+                Err(e) => println!("Error reading known peers: {e}"),
+            }
+
+            let mut interval = time::interval(time::Duration::from_secs(30));
 
             loop {
                 tokio::select! {
-                    line = stdin.next_line() => {
-                        let line = line?.expect("stdin closed");
-                        if line.trim() == "sync" {
+                     _ = interval.tick() => {
+                        println!("Periodically trying to connect to known peers...");
+                        if let Ok(known_peers) = get_known_peers() {
+                            for peer_addr in known_peers {
+                                if let Err(e) = swarm.dial(peer_addr.clone()) {
+                                    println!("Failed to dial known peer {peer_addr}: {e}");
+                                }
+                            }
+                        }
+                    }
+
+                    event = swarm.select_next_some() => match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                            println!("Connection established with: {peer_id}");
+                            let remote_addr = endpoint.get_remote_address();
+                            if let Err(e) = add_known_peer(remote_addr) {
+                                println!("Could not save peer address: {e}");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             let message = SyncMessage::AskForCommits;
                             let json = serde_json::to_string(&message)?;
                             swarm.behaviour_mut().floodsub.publish(floodsub_topic.clone(), json);
-                            println!("Published 'AskForCommits' to peers.");
-                        } else {
-                             swarm.behaviour_mut().floodsub.publish(floodsub_topic.clone(), line);
                         }
-
-                    }
-                    event = swarm.select_next_some() => {
-                        match event {
-                            SwarmEvent::NewListenAddr { address, .. } => {
-                                println!("Listening on {address}");
-                            }
-                            SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(event)) => {
-                                match event {
-                                    mdns::Event::Discovered(list) => {
-                                        for (peer, _) in list {
-                                            swarm.behaviour_mut().floodsub.add_node_to_partial_view(peer);
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            println!("Listening on {address}");
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(event)) => {
+                            match event {
+                                mdns::Event::Discovered(list) => {
+                                    for (peer, addr) in list {
+                                        swarm.behaviour_mut().floodsub.add_node_to_partial_view(peer);
+                                         if let Err(e) = add_known_peer(&addr) {
+                                            println!("Could not save discovered peer address: {e}");
                                         }
                                     }
-                                    mdns::Event::Expired(list) => {
-                                        for (peer, _) in list {
-                                            if !swarm.behaviour().mdns.discovered_nodes().any(|p| p == &peer) {
-                                                swarm.behaviour_mut().floodsub.remove_node_from_partial_view(&peer);
-                                            }
+                                    let message = SyncMessage::AskForCommits;
+                                    let json = serde_json::to_string(&message)?;
+                                    swarm.behaviour_mut().floodsub.publish(floodsub_topic.clone(), json);
+                                }
+                                mdns::Event::Expired(list) => {
+                                    for (peer, _) in list {
+                                        if !swarm.behaviour().mdns.discovered_nodes().any(|p| p == &peer) {
+                                            swarm.behaviour_mut().floodsub.remove_node_from_partial_view(&peer);
                                         }
                                     }
                                 }
                             }
-                            SwarmEvent::Behaviour(MyBehaviourEvent::Floodsub(event)) => {
-                                if let FloodsubEvent::Message(message) = event {
-                                     if let Ok(sync_message) = serde_json::from_slice::<SyncMessage>(&message.data) {
-                                        match sync_message {
-                                            SyncMessage::AskForCommits => {
-                                                println!("Received AskForCommits from {:?}", message.source);
-                                                let local_commits = get_local_commits()?;
-                                                let response = SyncMessage::MyCommits { commits: local_commits };
-                                                let json = serde_json::to_string(&response)?;
-                                                swarm.behaviour_mut().floodsub.publish(floodsub_topic.clone(), json);
+                        }
+                        SwarmEvent::Behaviour(MyBehaviourEvent::Floodsub(event)) => {
+                            if let FloodsubEvent::Message(message) = event {
+                                    if let Ok(sync_message) = serde_json::from_slice::<SyncMessage>(&message.data) {
+                                    match sync_message {
+                                        SyncMessage::AskForCommits => {
+                                            println!("Received AskForCommits from {:?}", message.source);
+                                            let local_commits = get_local_commits()?;
+                                            let response = SyncMessage::MyCommits { commits: local_commits };
+                                            let json = serde_json::to_string(&response)?;
+                                            swarm.behaviour_mut().floodsub.publish(floodsub_topic.clone(), json);
+                                        }
+                                        SyncMessage::MyCommits { commits } => {
+                                            println!("Received MyCommits from {:?}", message.source);
+                                            let local_commits = get_local_commits()?;
+                                            let new_commits: Vec<_> = commits.into_iter().filter(|c| !local_commits.contains(c)).collect();
+                                            if !new_commits.is_empty() {
+                                                println!("New remote commits found: {:?}", new_commits);
+                                                for commit_id in new_commits {
+                                                    println!("Requesting full data for commit {}", commit_id);
+                                                    let request_message = SyncMessage::AskForCommit { commit_id };
+                                                    let json = serde_json::to_string(&request_message)?;
+                                                    swarm.behaviour_mut().floodsub.publish(floodsub_topic.clone(), json);
+                                                }
+                                            } else {
+                                                println!("You are up to date with peer {:?}.", message.source);
                                             }
-                                            SyncMessage::MyCommits { commits } => {
-                                                println!("Received MyCommits from {:?}", message.source);
-                                                let local_commits = get_local_commits()?;
-                                                let new_commits: Vec<_> = commits.into_iter().filter(|c| !local_commits.contains(c)).collect();
-                                                if !new_commits.is_empty() {
-                                                    println!("New remote commits found: {:?}", new_commits);
-                                                } else {
-                                                    println!("You are up to date with peer {:?}.", message.source);
+                                        }
+                                        SyncMessage::AskForCommit { commit_id } => {
+                                            println!("Received AskForCommit for {} from {:?}", commit_id, message.source);
+    
+                                            let log_file_path = Path::new(".git2p").join("logs").join(format!("{}.json", commit_id));
+                                            let commit: Commit = match fs::read_to_string(log_file_path) {
+                                                Ok(content) => serde_json::from_str(&content)?,
+                                                Err(_) => {
+                                                    println!("Could not read commit log for {}", commit_id);
+                                                    continue;
+                                                }
+                                            };
+    
+                                            let commit_dir = Path::new(".git2p").join("versions").join(&commit_id);
+                                            let mut files = Vec::new();
+                                            if let Ok(entries) = fs::read_dir(commit_dir) {
+                                                for entry in entries.filter_map(|e| e.ok()) {
+                                                    let path = entry.path();
+                                                    if path.is_file() {
+                                                        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                                                            if let Ok(content) = fs::read(&path) {
+                                                                files.push((file_name.to_string(), content));
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
+    
+                                            let full_commit = FullCommit { commit, files };
+                                            let response = SyncMessage::FullCommit(full_commit);
+                                            let json = serde_json::to_string(&response)?;
+                                            swarm.behaviour_mut().floodsub.publish(floodsub_topic.clone(), json);
                                         }
-                                    } else {
-                                        println!(
-                                            "Received: '{:?}' from {:?}",
-                                            String::from_utf8_lossy(&message.data),
-                                            message.source
-                                        );
+                                        SyncMessage::FullCommit(full_commit) => {
+                                            println!("Received FullCommit {} from {:?}", full_commit.commit.id, message.source);
+    
+                                            let commit_id = &full_commit.commit.id;
+                                            let repo_path = Path::new(".git2p");
+    
+                                            let logs_path = repo_path.join("logs");
+                                            fs::create_dir_all(&logs_path)?;
+                                            let log_file_path = logs_path.join(format!("{}.json", commit_id));
+                                            fs::write(log_file_path, serde_json::to_string_pretty(&full_commit.commit)?)?;
+    
+                                            let commit_dir = repo_path.join("versions").join(commit_id);
+                                            fs::create_dir_all(&commit_dir)?;
+                                            for (file_name, content) in full_commit.files {
+                                                fs::write(commit_dir.join(file_name), &content)?;
+                                            }
+    
+                                            println!("Successfully synchronized commit {}", commit_id);
+                                        }
                                     }
+                                } else {
+                                    println!(
+                                        "Received: '{:?}' from {:?}",
+                                        String::from_utf8_lossy(&message.data),
+                                        message.source
+                                    );
                                 }
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
                 }
             }
@@ -491,6 +589,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             sp.stop("Done.");
         }
+        Commands::Pull => {
+            let sp = spinner();
+            sp.start("Pulling changes...");
+
+            let repo_path = Path::new(".git2p");
+            if !repo_path.exists() {
+                sp.error("Repository not initialized! Run 'git2p init' first.");
+                return Ok(());
+            }
+
+            let logs_path = repo_path.join("logs");
+            if !logs_path.exists() {
+                sp.stop("No commits to pull.");
+                return Ok(());
+            }
+
+            let mut commits: Vec<Commit> = fs::read_dir(logs_path)?
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let path = entry.path();
+                    if path.is_file() && path.extension()? == "json" {
+                        let content = fs::read_to_string(path).ok()?;
+                        serde_json::from_str(&content).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            if commits.is_empty() {
+                sp.stop("No commits to pull.");
+                return Ok(());
+            }
+            
+            commits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            let latest_commit = &commits[0];
+
+            let versions_path = repo_path.join("versions");
+            let commit_path = versions_path.join(&latest_commit.id);
+
+            if !commit_path.exists() {
+                sp.error(format!("Commit with id '{}' not found.", latest_commit.id));
+                return Ok(());
+            }
+
+            let files_to_revert = fs::read_dir(&commit_path)?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+
+            for file_path in files_to_revert {
+                let file_name = file_path.file_name().unwrap();
+                let dest_path = Path::new(".").join(file_name);
+                fs::copy(&file_path, &dest_path)?;
+                sp.set_message(format!("Pulled '{}'", file_name.to_str().unwrap()));
+            }
+
+            sp.stop(format!("Successfully pulled latest commit {}.", latest_commit.id));
+        }
     }
     Ok(())
 }
@@ -517,4 +674,31 @@ fn get_local_commits() -> Result<Vec<String>, Box<dyn Error>> {
         })
         .collect();
     Ok(commits)
+}
+
+fn get_known_peers() -> Result<Vec<Multiaddr>, Box<dyn Error>> {
+    let path = Path::new(".git2p").join("known_peers.json");
+    if !path.exists() {
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(&path, "[]")?;
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let addresses: Vec<String> = serde_json::from_str(&content)?;
+    Ok(addresses.into_iter().filter_map(|s| s.parse().ok()).collect())
+}
+
+fn add_known_peer(addr: &Multiaddr) -> Result<(), Box<dyn Error>> {
+    let path = Path::new(".git2p").join("known_peers.json");
+    let mut peers = get_known_peers()?;
+    if !peers.contains(addr) {
+        peers.push(addr.clone());
+        let peer_strings: Vec<String> = peers.iter().map(|p| p.to_string()).collect();
+        let content = serde_json::to_string_pretty(&peer_strings)?;
+        fs::write(path, content)?;
+    }
+    Ok(())
 }
