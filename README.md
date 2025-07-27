@@ -17,15 +17,15 @@ git2p is a CLI application for synchronizing files between computers directly (p
 ## Roadmap
 
 ### MVP
-- [ ] Repository initialization (`init`)
-- [ ] Add files to tracking (`add`)
-- [ ] Commit changes (`commit`)
-- [ ] View change history (`log`)
-- [ ] Revert to previous version (`revert`)
-- [ ] File change watching
-- [ ] P2P connection between two computers (`connect`)
-- [ ] Synchronize changes (`sync`)
-- [ ] Colorful CLI interface
+- [x] Repository initialization (`init`)
+- [x] Add files to tracking (`add`)
+- [x] Commit changes (`commit`)
+- [x] View change history (`log`)
+- [x] Revert to previous version (`revert`)
+- [x] File change watching
+- [x] P2P connection between two computers (`connect`)
+- [x] Synchronize changes (`sync`)
+- [x] Colorful CLI interface
 
 ### Future
 - [ ] Automatic sync when new devices join
@@ -35,4 +35,4 @@ git2p is a CLI application for synchronizing files between computers directly (p
 
 ## Progress
 
-- [ ] MVP: 0%
+- [x] MVP: 100%
